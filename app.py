@@ -1,233 +1,487 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+llm_machine_advisor.py
+Analiza CPU/RAM/SWAP y recomienda modelos GGUF (llama.cpp / Ollama / LocalAI)
+con clasificación: PERFECTO / BIEN / AJUSTADO / MAL.
+
+Enfoque:
+- Pesos: params * (bits_per_weight/8)
+- KV cache: heurística por (layers * hidden * ctx * bytes * 2[K+V]) con fallback conservador
+- Overhead: base + % del tamaño de pesos
+
+Fuentes (para contexto general de quants/bpw):
+- Explicación bpw y quants legacy/k-quants (incluye ejemplo Q4_1 ~4.0625 bpw) :contentReference[oaicite:1]{index=1}
+- Librería de modelos populares (tamaños y familias) :contentReference[oaicite:2]{index=2}
+"""
+
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List
+from typing import Dict, List, Optional, Tuple
+
+# Optional deps
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
+
+try:
+    from tabulate import tabulate  # type: ignore
+except Exception:
+    tabulate = None
+
 
 # -----------------------------
-# HW detection
+# Quantization heuristics (bpw)
 # -----------------------------
-def read_meminfo_kb() -> Dict[str, int]:
-    out = {}
-    with open("/proc/meminfo", "r", encoding="utf-8") as f:
-        for line in f:
-            m = re.match(r"^(\w+):\s+(\d+)\s+kB", line.strip())
-            if m:
-                out[m.group(1)] = int(m.group(2))
-    return out
-
-def gb(x_kb: int) -> float:
-    return x_kb / (1024 * 1024)
-
-def cpu_model() -> str:
-    try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-            txt = f.read()
-        m = re.search(r"model name\s*:\s*(.+)", txt)
-        return m.group(1).strip() if m else "unknown"
-    except Exception:
-        return "unknown"
-
-def cpu_flags() -> List[str]:
-    try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-            txt = f.read()
-        m = re.search(r"flags\s*:\s*(.+)", txt)
-        if not m:
-            return []
-        return m.group(1).split()
-    except Exception:
-        return []
-
-def cores_threads() -> Dict[str, int]:
-    # Linux: os.cpu_count() = threads lógicos
-    threads = os.cpu_count() or 1
-    # cores físicos no siempre fácil sin psutil; aproximamos
-    return {"threads_logical": threads}
-
-def nvidia_vram_gb() -> Optional[float]:
-    if shutil.which("nvidia-smi") is None:
-        return None
-    try:
-        # total VRAM in MiB
-        cmd = ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]
-        out = subprocess.check_output(cmd, text=True).strip().splitlines()
-        if not out:
-            return None
-        # si hay varias GPUs, tomamos la mayor
-        mib = max(int(x.strip()) for x in out if x.strip().isdigit())
-        return mib / 1024.0
-    except Exception:
-        return None
-
-# -----------------------------
-# Estimación de memoria
-# -----------------------------
-# Memoria modelo por 1B params (GB) según quant (aprox GGUF)
-Q_GB_PER_1B = {
-    "Q4": 0.55,
-    "Q5": 0.68,
-    "Q8": 1.00,
+# bpw: bits per weight (promedio). Para K-quants, valores típicos rondan ~4.6 en Q4KM en algunos modelos (varía).
+# Usamos valores conservadores y simples.
+BPW_MAP: Dict[str, float] = {
+    # Legacy
+    "Q2_K": 2.6,
+    "Q3_K_S": 3.4,
+    "Q3_K_M": 3.7,
+    "Q3_K_L": 3.9,
+    "Q4_0": 4.0,
+    "Q4_1": 4.0625,   # citado como ejemplo en explicación de legacy quants :contentReference[oaicite:3]{index=3}
+    "Q4_K_S": 4.4,
+    "Q4_K_M": 4.65,   # conservador (en la práctica suele estar ~4.6 bpw en varios casos) :contentReference[oaicite:4]{index=4}
+    "Q5_0": 5.0,
+    "Q5_1": 5.125,
+    "Q5_K_S": 5.4,
+    "Q5_K_M": 5.6,
+    "Q6_K": 6.6,
+    "Q8_0": 8.5,      # incluye overhead de escalas/bloques
+    "F16": 16.0,
 }
 
-# KV cache por token (KB/token) para familias Llama-like (aprox, fp16)
-# Esto es “consultoría” práctica: no es exacto por arquitectura, pero sirve para decidir.
-KV_KB_PER_TOKEN = {
-    "8B": 128,
-    "13B": 200,
-    "34B": 520,
-    "70B": 1024,
-}
+DEFAULT_QUANTS = ["Q4_K_M", "Q5_K_M", "Q8_0"]
 
-FAMILIES = [
-    ("8B", 8),
-    ("13B", 13),
-    ("34B", 34),
-    ("70B", 70),
+
+# -----------------------------------
+# Model catalog (popular local families)
+# -----------------------------------
+@dataclass(frozen=True)
+class ModelSpec:
+    family: str
+    name: str
+    params_b: float                 # billions
+    task: str                       # general / coding / reasoning / multilingual / vision
+    # Architecture hints for KV cache estimation (best-effort, conservative)
+    n_layers: Optional[int] = None
+    hidden: Optional[int] = None
+    notes: str = ""
+
+
+# Curado práctico (sizes típicos que ves en catálogos locales) :contentReference[oaicite:5]{index=5}
+MODEL_CATALOG: List[ModelSpec] = [
+    # Llama
+    ModelSpec("meta", "Llama 3.2 Instruct", 1.0, "multilingual", n_layers=16, hidden=2048, notes="Muy liviano; ideal CPU"),
+    ModelSpec("meta", "Llama 3.2 Instruct", 3.0, "multilingual", n_layers=28, hidden=3072, notes="Buen balance en 16GB"),
+    ModelSpec("meta", "Llama 3.1 Instruct", 8.0, "general", n_layers=32, hidden=4096, notes="El ‘sweet spot’ típico"),
+    ModelSpec("meta", "Llama 3.1 Instruct", 70.0, "general", n_layers=80, hidden=8192, notes="Requiere mucha RAM/VRAM"),
+
+    # Qwen
+    ModelSpec("alibaba", "Qwen 2.5 Instruct", 0.5, "multilingual", n_layers=24, hidden=1024, notes="Excelente ultra-ligero"),
+    ModelSpec("alibaba", "Qwen 2.5 Instruct", 1.5, "multilingual", n_layers=28, hidden=1536, notes="Muy buen básico"),
+    ModelSpec("alibaba", "Qwen 2.5 Instruct", 3.0, "multilingual", n_layers=36, hidden=2048, notes="Razonable en CPU"),
+    ModelSpec("alibaba", "Qwen 2.5 Instruct", 7.0, "multilingual", n_layers=32, hidden=4096, notes="Fuerte general"),
+    ModelSpec("alibaba", "Qwen 2.5 Instruct", 14.0, "multilingual", n_layers=40, hidden=5120, notes="Ya pesado en CPU"),
+    ModelSpec("alibaba", "Qwen 2.5 Instruct", 32.0, "multilingual", n_layers=64, hidden=5120, notes="Normalmente servidor"),
+    ModelSpec("alibaba", "Qwen 2.5 Coder", 7.0, "coding", n_layers=32, hidden=4096, notes="Código en local"),
+    ModelSpec("alibaba", "Qwen 2.5 Coder", 14.0, "coding", n_layers=40, hidden=5120, notes="Mejor pero pesado"),
+    ModelSpec("alibaba", "Qwen 3", 8.0, "reasoning", n_layers=32, hidden=4096, notes="Más foco en razonamiento"),
+    ModelSpec("alibaba", "Qwen 3", 14.0, "reasoning", n_layers=40, hidden=5120, notes="Razonamiento, más RAM"),
+
+    # Mistral
+    ModelSpec("mistral", "Mistral 7B Instruct", 7.0, "general", n_layers=32, hidden=4096, notes="Rinde muy bien en CPU"),
+    ModelSpec("mistral", "Mistral Nemo", 12.0, "general", n_layers=40, hidden=5120, notes="12B con contexto grande"),
+    ModelSpec("mistral", "Mixtral 8x7B (MoE)", 46.7, "general", n_layers=32, hidden=4096, notes="MoE: pesado en RAM; mejor GPU"),
+
+    # Gemma
+    ModelSpec("google", "Gemma 2", 2.0, "general", n_layers=18, hidden=2048, notes="Pequeño y decente"),
+    ModelSpec("google", "Gemma 2", 9.0, "general", n_layers=42, hidden=3584, notes="Muy buen general"),
+    ModelSpec("google", "Gemma 2", 27.0, "general", n_layers=46, hidden=4608, notes="Servidor/VRAM"),
+    ModelSpec("google", "Gemma 3", 4.0, "general", n_layers=28, hidden=3072, notes="Buen balance moderno"),
+    ModelSpec("google", "Gemma 3", 12.0, "general", n_layers=42, hidden=4096, notes="Requiere más RAM"),
+
+    # Phi
+    ModelSpec("microsoft", "Phi-3 Mini", 3.8, "general", n_layers=32, hidden=3072, notes="Calidad alta por tamaño"),
+    ModelSpec("microsoft", "Phi-3 Medium", 14.0, "general", n_layers=40, hidden=5120, notes="Buen salto de calidad"),
+    ModelSpec("microsoft", "Phi-4", 14.0, "reasoning", n_layers=40, hidden=5120, notes="Mejor razonamiento; pesado"),
+
+    # DeepSeek (razonamiento)
+    ModelSpec("deepseek", "DeepSeek R1 Distill", 1.5, "reasoning", n_layers=28, hidden=1536, notes="Razonamiento liviano"),
+    ModelSpec("deepseek", "DeepSeek R1", 7.0, "reasoning", n_layers=32, hidden=4096, notes="Razonamiento local"),
+    ModelSpec("deepseek", "DeepSeek R1", 14.0, "reasoning", n_layers=40, hidden=5120, notes="Mejor, más RAM"),
+
+    # CodeLlama
+    ModelSpec("meta", "CodeLlama Instruct", 7.0, "coding", n_layers=32, hidden=4096, notes="Coding clásico"),
+    ModelSpec("meta", "CodeLlama Instruct", 13.0, "coding", n_layers=40, hidden=5120, notes="Más capaz, más pesado"),
+    ModelSpec("meta", "CodeLlama Instruct", 34.0, "coding", n_layers=48, hidden=8192, notes="Servidor/GPU normalmente"),
+
+    # TinyLlama
+    ModelSpec("community", "TinyLlama Chat", 1.1, "general", n_layers=22, hidden=2048, notes="Ultra-ligero"),
 ]
 
+
+# -----------------------------
+# System probing
+# -----------------------------
 @dataclass
-class Recommendation:
-    family: str
-    params_b: int
-    quant: str
-    ctx: int
-    est_model_gb: float
-    est_kv_gb: float
-    est_total_gb: float
+class MachineInfo:
+    os: str
+    arch: str
+    cpu_model: str
+    physical_cores: int
+    logical_cores: int
+    cpu_mhz: Optional[float]
+    cpu_flags: List[str]
+    ram_total_gb: float
     ram_available_gb: float
-    margin_gb: float
-    semaforo: str
-    reason: str
-    gpu_fit: Optional[str]  # texto simple si hay VRAM
+    swap_total_gb: float
+    swap_free_gb: float
 
-def semaforo_from_margin(margin_gb: float) -> str:
-    if margin_gb >= 2.5:
-        return "🟢"
-    if margin_gb >= 1.0:
-        return "🟡"
-    return "🔴"
 
-def estimate_model_gb(params_b: int, quant: str) -> float:
-    base = params_b * Q_GB_PER_1B[quant]
-    return base * 1.15  # +15% overhead/buffers/mmap
+def run_cmd(cmd: List[str]) -> str:
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
+        return out.strip()
+    except Exception:
+        return ""
 
-def estimate_kv_gb(family: str, ctx: int) -> float:
-    kb_per_tok = KV_KB_PER_TOKEN[family]
-    total_kb = kb_per_tok * ctx
-    return total_kb / (1024 * 1024)  # KB -> GB
 
-def gpu_fit_text(vram_gb: float, total_gb: float) -> str:
-    # simplificado: si VRAM >= total_gb => full offload potencial (depende runtime)
-    if vram_gb >= total_gb + 1.0:
-        return f"VRAM OK (≈{vram_gb:.1f} GB) para offload casi total"
-    if vram_gb >= (0.60 * total_gb):
-        return f"VRAM parcial (≈{vram_gb:.1f} GB): offload parcial, mejora tok/s"
-    return f"VRAM baja (≈{vram_gb:.1f} GB): probablemente CPU mostly"
+def get_cpu_flags_linux() -> List[str]:
+    flags = set()
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.lower().startswith("flags"):
+                    _, v = line.split(":", 1)
+                    for fl in v.strip().split():
+                        flags.add(fl)
+                    break
+    except Exception:
+        pass
+    return sorted(flags)
 
-def main():
-    ap = argparse.ArgumentParser(description="Consultor LLM: recomienda tamaños/quant sin descargar modelos.")
-    ap.add_argument("--ctx", type=int, default=4096, help="Contexto objetivo (tokens). Ej: 2048/4096/8192")
-    ap.add_argument("--only", default="", help="Filtra familias: 8B,13B,34B,70B (coma-separado)")
-    ap.add_argument("--json-out", default="", help="Si se indica, guarda resultado JSON")
-    args = ap.parse_args()
 
-    mi = read_meminfo_kb()
-    ram_total = gb(mi.get("MemTotal", 0))
-    ram_avail = gb(mi.get("MemAvailable", 0))
+def get_cpu_model_linux() -> str:
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or "Unknown CPU"
 
-    flags = set(cpu_flags())
-    vram = nvidia_vram_gb()
 
-    sysinfo = {
-        "cpu": cpu_model(),
-        "threads_logical": cores_threads()["threads_logical"],
-        "ram_total_gb": round(ram_total, 2),
-        "ram_available_gb": round(ram_avail, 2),
-        "cpu_flags_has_avx2": ("avx2" in flags),
-        "cpu_flags_has_fma": ("fma" in flags),
-        "nvidia_vram_gb": None if vram is None else round(vram, 2),
-        "ctx_target": args.ctx,
+def get_cpu_mhz_linux() -> Optional[float]:
+    # Best effort
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.lower().startswith("cpu mhz"):
+                    return float(line.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def get_machine_info() -> MachineInfo:
+    os_name = f"{platform.system()} {platform.release()}"
+    arch = platform.machine()
+
+    if psutil:
+        physical = psutil.cpu_count(logical=False) or 0
+        logical = psutil.cpu_count(logical=True) or 0
+        vm = psutil.virtual_memory()
+        sm = psutil.swap_memory()
+        ram_total_gb = vm.total / (1024**3)
+        ram_available_gb = vm.available / (1024**3)
+        swap_total_gb = sm.total / (1024**3)
+        swap_free_gb = (sm.total - sm.used) / (1024**3)
+    else:
+        # Fallback minimal
+        physical = os.cpu_count() or 0
+        logical = physical
+        ram_total_gb = ram_available_gb = 0.0
+        swap_total_gb = swap_free_gb = 0.0
+
+    if platform.system().lower() == "linux":
+        cpu_model = get_cpu_model_linux()
+        cpu_flags = get_cpu_flags_linux()
+        cpu_mhz = get_cpu_mhz_linux()
+    else:
+        cpu_model = platform.processor() or "Unknown CPU"
+        cpu_flags = []
+        cpu_mhz = None
+
+    return MachineInfo(
+        os=os_name,
+        arch=arch,
+        cpu_model=cpu_model,
+        physical_cores=physical,
+        logical_cores=logical,
+        cpu_mhz=cpu_mhz,
+        cpu_flags=cpu_flags,
+        ram_total_gb=ram_total_gb,
+        ram_available_gb=ram_available_gb,
+        swap_total_gb=swap_total_gb,
+        swap_free_gb=swap_free_gb,
+    )
+
+
+# -----------------------------
+# Memory estimation
+# -----------------------------
+@dataclass
+class FitResult:
+    family: str
+    model: str
+    task: str
+    params_b: float
+    quant: str
+    bpw: float
+    weights_gb: float
+    kv_cache_gb: float
+    overhead_gb: float
+    total_required_gb: float
+    fit: str
+    notes: str
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def estimate_weights_gb(params_b: float, quant: str) -> Tuple[float, float]:
+    bpw = BPW_MAP.get(quant.upper(), 4.65)  # default conservador
+    params = params_b * 1e9
+    bytes_weights = params * (bpw / 8.0)
+    gb = bytes_weights / (1024**3)
+    return gb, bpw
+
+
+def estimate_kv_cache_gb(spec: ModelSpec, ctx: int, kv_dtype_bytes: int, conservative_factor: float) -> float:
+    """
+    KV cache ~ 2 (K+V) * n_layers * ctx * hidden * bytes
+    Usamos hints (layers/hidden) si están; si no, fallback: proporcional a params.
+    """
+    if spec.n_layers and spec.hidden:
+        bytes_kv = 2.0 * spec.n_layers * ctx * spec.hidden * kv_dtype_bytes
+        gb = (bytes_kv / (1024**3)) * conservative_factor
+        return gb
+
+    # Fallback: ~ 0.22 GB por 1B params a ctx=2048 (muy aproximado, conservador)
+    gb = 0.22 * spec.params_b * (ctx / 2048.0) * conservative_factor
+    return gb
+
+
+def estimate_overhead_gb(weights_gb: float) -> float:
+    # Overhead base + 10% del peso (buffers, tokenization, mmap, etc.)
+    return 0.6 + 0.10 * weights_gb
+
+
+def classify_fit(total_req: float, budget: float) -> str:
+    # thresholds conservadores
+    if total_req <= budget * 0.60:
+        return "PERFECTO"
+    if total_req <= budget * 0.80:
+        return "BIEN"
+    if total_req <= budget * 0.95:
+        return "AJUSTADO"
+    return "MAL"
+
+
+def cpu_capability_hint(flags: List[str]) -> str:
+    f = set(flags)
+    if "avx512f" in f:
+        return "CPU: AVX-512 (muy bien)"
+    if "avx2" in f:
+        return "CPU: AVX2 (bien)"
+    if "avx" in f:
+        return "CPU: AVX (ok)"
+    return "CPU: sin AVX (lento; prioriza modelos <=3B)"
+
+
+# -----------------------------
+# Main scoring / ranking
+# -----------------------------
+def score_result(r: FitResult, preference: str) -> float:
+    # Menor total requerido es mejor, y "fit" mejor es mejor.
+    fit_bonus = {"PERFECTO": 0.0, "BIEN": 5.0, "AJUSTADO": 15.0, "MAL": 100.0}[r.fit]
+    pref_bonus = 0.0
+    if preference and preference != "any":
+        if r.task == preference:
+            pref_bonus -= 3.0
+        # coding prefer: penaliza no-coding levemente
+        elif preference == "coding" and r.task != "coding":
+            pref_bonus += 2.0
+        elif preference == "reasoning" and r.task != "reasoning":
+            pref_bonus += 2.0
+
+    # objetivo: minimizar (mem + penalizaciones)
+    return r.total_required_gb + fit_bonus + pref_bonus
+
+
+def build_recommendations(
+    mi: MachineInfo,
+    ctx: int,
+    headroom: float,
+    quants: List[str],
+    kv_dtype_bytes: int,
+    kv_conservative_factor: float,
+    preference: str,
+    top_n: int,
+) -> Tuple[List[FitResult], Dict]:
+    budget = max(0.0, mi.ram_total_gb * (1.0 - headroom))
+
+    results: List[FitResult] = []
+    for spec in MODEL_CATALOG:
+        for q in quants:
+            w_gb, bpw = estimate_weights_gb(spec.params_b, q)
+            kv_gb = estimate_kv_cache_gb(spec, ctx=ctx, kv_dtype_bytes=kv_dtype_bytes, conservative_factor=kv_conservative_factor)
+            ov_gb = estimate_overhead_gb(w_gb)
+            total = w_gb + kv_gb + ov_gb
+            fit = classify_fit(total, budget)
+            results.append(
+                FitResult(
+                    family=spec.family,
+                    model=spec.name,
+                    task=spec.task,
+                    params_b=spec.params_b,
+                    quant=q.upper(),
+                    bpw=bpw,
+                    weights_gb=w_gb,
+                    kv_cache_gb=kv_gb,
+                    overhead_gb=ov_gb,
+                    total_required_gb=total,
+                    fit=fit,
+                    notes=spec.notes,
+                )
+            )
+
+    # rank
+    results.sort(key=lambda r: score_result(r, preference))
+    top = results[:top_n]
+
+    summary = {
+        "machine": asdict(mi),
+        "budget_gb": budget,
+        "ctx": ctx,
+        "headroom": headroom,
+        "kv_dtype_bytes": kv_dtype_bytes,
+        "kv_conservative_factor": kv_conservative_factor,
+        "preference": preference,
+        "cpu_hint": cpu_capability_hint(mi.cpu_flags),
     }
+    return top, summary
 
-    only = set(x.strip() for x in args.only.split(",") if x.strip())
-    families = [f for f in FAMILIES if (not only or f[0] in only)]
 
-    recs: List[Recommendation] = []
-    for fam, pb in families:
-        for quant in ("Q4", "Q5", "Q8"):
-            est_model = estimate_model_gb(pb, quant)
-            est_kv = estimate_kv_gb(fam, args.ctx)
-            # margen anti-swap extra (SO + caches + margen humano)
-            safety = 1.5
-            est_total = est_model + est_kv + safety
+def print_table(results: List[FitResult]) -> None:
+    rows = []
+    for r in results:
+        rows.append([
+            r.fit,
+            f"{r.model}",
+            r.task,
+            f"{r.params_b:.1f}B",
+            r.quant,
+            f"{r.total_required_gb:.2f} GB",
+            f"W:{r.weights_gb:.2f}  KV:{r.kv_cache_gb:.2f}  OH:{r.overhead_gb:.2f}",
+            r.notes,
+        ])
 
-            margin = ram_avail - est_total
-            sem = semaforo_from_margin(margin)
+    headers = ["FIT", "MODELO", "TAREA", "PARAMS", "QUANT", "RAM EST.", "DESGLOSE", "NOTAS"]
+    if tabulate:
+        print(tabulate(rows, headers=headers, tablefmt="github"))
+    else:
+        # Fallback simple
+        print(" | ".join(headers))
+        print("-" * 120)
+        for row in rows:
+            print(" | ".join(str(x) for x in row))
 
-            reason = f"OK para probar" if sem != "🔴" else "Riesgo de swap/OOM o inutilmente lento"
-            if sem == "🟡":
-                reason = "Corre, pero justo: baja ctx o usa Q4"
-            if fam in ("34B", "70B") and quant in ("Q8", "Q5") and sem != "🟢":
-                reason += " (estos tamaños suelen exigir mucha RAM)"
 
-            gpu_txt = None
-            if vram is not None:
-                gpu_txt = gpu_fit_text(vram, est_total)
+def main() -> None:
+    p = argparse.ArgumentParser(description="Analizador de máquina -> recomendador de modelos GGUF")
+    p.add_argument("--ctx", type=int, default=2048, help="Context length (KV cache escala con esto). Default 2048.")
+    p.add_argument("--headroom", type=float, default=0.25, help="Reserva de RAM (0.25 = usar 75%%).")
+    p.add_argument("--quants", type=str, default=",".join(DEFAULT_QUANTS),
+                   help="Lista de quants separados por coma. Ej: Q4_K_M,Q5_K_M,Q8_0")
+    p.add_argument("--kv-bytes", type=int, default=2, help="Bytes por elemento para KV cache (2 = fp16).")
+    p.add_argument("--kv-factor", type=float, default=1.20,
+                   help="Factor conservador KV (>=1). Default 1.20 (sube un poco para evitar OOM).")
+    p.add_argument("--prefer", type=str, default="any",
+                   choices=["any", "general", "coding", "reasoning", "multilingual", "vision"],
+                   help="Preferencia de tarea para ranking.")
+    p.add_argument("--top", type=int, default=25, help="Top N recomendaciones.")
+    p.add_argument("--json-out", type=str, default="", help="Ruta para exportar JSON (opcional).")
+    args = p.parse_args()
 
-            recs.append(Recommendation(
-                family=fam,
-                params_b=pb,
-                quant=quant,
-                ctx=args.ctx,
-                est_model_gb=round(est_model, 2),
-                est_kv_gb=round(est_kv, 2),
-                est_total_gb=round(est_total, 2),
-                ram_available_gb=round(ram_avail, 2),
-                margin_gb=round(margin, 2),
-                semaforo=sem,
-                reason=reason,
-                gpu_fit=gpu_txt,
-            ))
+    mi = get_machine_info()
 
-    # Orden: primero 🟢, luego 🟡, luego 🔴, y por mayor margen
-    order = {"🟢": 0, "🟡": 1, "🔴": 2}
-    recs_sorted = sorted(recs, key=lambda r: (order[r.semaforo], -r.margin_gb))
+    quants = [q.strip() for q in args.quants.split(",") if q.strip()]
+    top, summary = build_recommendations(
+        mi=mi,
+        ctx=args.ctx,
+        headroom=clamp(args.headroom, 0.05, 0.60),
+        quants=quants,
+        kv_dtype_bytes=args.kv_bytes,
+        kv_conservative_factor=max(1.0, args.kv_factor),
+        preference=args.prefer,
+        top_n=max(5, args.top),
+    )
 
-    print("=== HW ===")
-    print(json.dumps(sysinfo, indent=2, ensure_ascii=False))
+    # Header
+    print("=" * 88)
+    print("LLM Machine Advisor (GGUF) - resultado")
+    print("=" * 88)
+    print(f"OS/ARCH : {mi.os} / {mi.arch}")
+    print(f"CPU     : {mi.cpu_model}")
+    print(f"CORES   : {mi.physical_cores} físicos / {mi.logical_cores} hilos")
+    if mi.cpu_mhz:
+        print(f"CPU MHz : ~{mi.cpu_mhz:.0f} MHz")
+    print(f"RAM     : {mi.ram_total_gb:.2f} GB total | {mi.ram_available_gb:.2f} GB available")
+    print(f"SWAP    : {mi.swap_total_gb:.2f} GB total | {mi.swap_free_gb:.2f} GB free")
+    print(f"HINT    : {summary['cpu_hint']}")
+    print(f"BUDGET  : {summary['budget_gb']:.2f} GB (headroom={summary['headroom']:.2f})")
+    print(f"CTX     : {summary['ctx']} (KV bytes={summary['kv_dtype_bytes']}, KV factor={summary['kv_conservative_factor']})")
+    print("=" * 88)
+    print()
 
-    print("\n=== Recomendación (sin descargar modelos) ===")
-    # imprime top por familia (mejor quant)
-    best_by_family: Dict[str, Recommendation] = {}
-    for r in recs_sorted:
-        if r.family not in best_by_family:
-            best_by_family[r.family] = r
+    print_table(top)
+    print()
 
-    for fam in [x[0] for x in families]:
-        r = best_by_family.get(fam)
-        if not r:
-            continue
-        print(f"\n[{fam}] mejor apuesta: {r.semaforo} {r.quant} @ ctx={r.ctx}")
-        print(f"  Est modelo: {r.est_model_gb} GB | KV: {r.est_kv_gb} GB | Total+seg: {r.est_total_gb} GB")
-        print(f"  RAM disponible: {r.ram_available_gb} GB | Margen: {r.margin_gb} GB -> {r.reason}")
-        if r.gpu_fit:
-            print(f"  GPU: {r.gpu_fit}")
-
-    # tabla completa resumida
-    print("\n=== Tabla completa (ordenada) ===")
-    for r in recs_sorted:
-        print(f"{r.semaforo} {r.family:>3} {r.quant} | total≈{r.est_total_gb:>6}GB | margen={r.margin_gb:>6}GB")
+    # Warnings / ops hints
+    if "avx2" not in set(mi.cpu_flags) and "avx512f" not in set(mi.cpu_flags):
+        print("[WARN] CPU sin AVX2/AVX512: prioriza modelos <= 3B (Q4_K_M).")
+    if mi.swap_total_gb > 0 and mi.swap_free_gb < (0.25 * mi.swap_total_gb):
+        print("[WARN] Swap muy usada: riesgo de thrashing si corres modelos AJUSTADO.")
+    if mi.ram_available_gb < (0.20 * mi.ram_total_gb):
+        print("[WARN] RAM available baja ahora mismo: cierra procesos antes de probar modelos.")
 
     if args.json_out:
-        payload = {"system": sysinfo, "recommendations": [asdict(r) for r in recs_sorted]}
+        payload = {
+            "summary": summary,
+            "recommendations": [asdict(r) for r in top],
+        }
+        os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
         with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        print(f"\nOK -> Guardado JSON: {args.json_out}")
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"\n[OK] JSON exportado en: {args.json_out}")
+
 
 if __name__ == "__main__":
     main()
