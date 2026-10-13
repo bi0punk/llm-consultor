@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
 llm_machine_advisor.py
@@ -12,8 +11,8 @@ Enfoque:
 - Overhead: base + % del tamaño de pesos
 
 Fuentes (para contexto general de quants/bpw):
-- Explicación bpw y quants legacy/k-quants (incluye ejemplo Q4_1 ~4.0625 bpw) :contentReference[oaicite:1]{index=1}
-- Librería de modelos populares (tamaños y familias) :contentReference[oaicite:2]{index=2}
+- Explicación bpw y quants legacy/k-quants (incluye ejemplo Q4_1 ~4.0625 bpw)
+- Librería de modelos populares (tamaños y familias)
 """
 
 from __future__ import annotations
@@ -22,11 +21,8 @@ import argparse
 import json
 import os
 import platform
-import re
-import shutil
 import subprocess
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
 
 # Optional deps
 try:
@@ -45,16 +41,16 @@ except Exception:
 # -----------------------------
 # bpw: bits per weight (promedio). Para K-quants, valores típicos rondan ~4.6 en Q4KM en algunos modelos (varía).
 # Usamos valores conservadores y simples.
-BPW_MAP: Dict[str, float] = {
+BPW_MAP: dict[str, float] = {
     # Legacy
     "Q2_K": 2.6,
     "Q3_K_S": 3.4,
     "Q3_K_M": 3.7,
     "Q3_K_L": 3.9,
     "Q4_0": 4.0,
-    "Q4_1": 4.0625,   # citado como ejemplo en explicación de legacy quants :contentReference[oaicite:3]{index=3}
+    "Q4_1": 4.0625,   # citado como ejemplo en explicación de legacy quants
     "Q4_K_S": 4.4,
-    "Q4_K_M": 4.65,   # conservador (en la práctica suele estar ~4.6 bpw en varios casos) :contentReference[oaicite:4]{index=4}
+    "Q4_K_M": 4.65,   # conservador (en la práctica suele estar ~4.6 bpw en varios casos)
     "Q5_0": 5.0,
     "Q5_1": 5.125,
     "Q5_K_S": 5.4,
@@ -77,35 +73,53 @@ class ModelSpec:
     params_b: float                 # billions
     task: str                       # general / coding / reasoning / multilingual / vision
     # Architecture hints for KV cache estimation (best-effort, conservative)
-    n_layers: Optional[int] = None
-    hidden: Optional[int] = None
+    n_layers: int | None = None
+    hidden: int | None = None
     notes: str = ""
 
 
-# Curado práctico (sizes típicos que ves en catálogos locales) :contentReference[oaicite:5]{index=5}
-MODEL_CATALOG: List[ModelSpec] = [
+# Curado práctico (sizes típicos que ves en catálogos locales)
+MODEL_CATALOG: list[ModelSpec] = [
     # Llama
-    ModelSpec("meta", "Llama 3.2 Instruct", 1.0, "multilingual", n_layers=16, hidden=2048, notes="Muy liviano; ideal CPU"),
-    ModelSpec("meta", "Llama 3.2 Instruct", 3.0, "multilingual", n_layers=28, hidden=3072, notes="Buen balance en 16GB"),
+    ModelSpec(
+        "meta", "Llama 3.2 Instruct", 1.0, "multilingual",
+        n_layers=16, hidden=2048, notes="Muy liviano; ideal CPU",
+    ),
+    ModelSpec(
+        "meta", "Llama 3.2 Instruct", 3.0, "multilingual",
+        n_layers=28, hidden=3072, notes="Buen balance en 16GB",
+    ),
     ModelSpec("meta", "Llama 3.1 Instruct", 8.0, "general", n_layers=32, hidden=4096, notes="El ‘sweet spot’ típico"),
     ModelSpec("meta", "Llama 3.1 Instruct", 70.0, "general", n_layers=80, hidden=8192, notes="Requiere mucha RAM/VRAM"),
 
     # Qwen
-    ModelSpec("alibaba", "Qwen 2.5 Instruct", 0.5, "multilingual", n_layers=24, hidden=1024, notes="Excelente ultra-ligero"),
+    ModelSpec(
+        "alibaba", "Qwen 2.5 Instruct", 0.5, "multilingual",
+        n_layers=24, hidden=1024, notes="Excelente ultra-ligero",
+    ),
     ModelSpec("alibaba", "Qwen 2.5 Instruct", 1.5, "multilingual", n_layers=28, hidden=1536, notes="Muy buen básico"),
     ModelSpec("alibaba", "Qwen 2.5 Instruct", 3.0, "multilingual", n_layers=36, hidden=2048, notes="Razonable en CPU"),
     ModelSpec("alibaba", "Qwen 2.5 Instruct", 7.0, "multilingual", n_layers=32, hidden=4096, notes="Fuerte general"),
     ModelSpec("alibaba", "Qwen 2.5 Instruct", 14.0, "multilingual", n_layers=40, hidden=5120, notes="Ya pesado en CPU"),
-    ModelSpec("alibaba", "Qwen 2.5 Instruct", 32.0, "multilingual", n_layers=64, hidden=5120, notes="Normalmente servidor"),
+    ModelSpec(
+        "alibaba", "Qwen 2.5 Instruct", 32.0, "multilingual",
+        n_layers=64, hidden=5120, notes="Normalmente servidor",
+    ),
     ModelSpec("alibaba", "Qwen 2.5 Coder", 7.0, "coding", n_layers=32, hidden=4096, notes="Código en local"),
     ModelSpec("alibaba", "Qwen 2.5 Coder", 14.0, "coding", n_layers=40, hidden=5120, notes="Mejor pero pesado"),
     ModelSpec("alibaba", "Qwen 3", 8.0, "reasoning", n_layers=32, hidden=4096, notes="Más foco en razonamiento"),
     ModelSpec("alibaba", "Qwen 3", 14.0, "reasoning", n_layers=40, hidden=5120, notes="Razonamiento, más RAM"),
 
     # Mistral
-    ModelSpec("mistral", "Mistral 7B Instruct", 7.0, "general", n_layers=32, hidden=4096, notes="Rinde muy bien en CPU"),
+    ModelSpec(
+        "mistral", "Mistral 7B Instruct", 7.0, "general",
+        n_layers=32, hidden=4096, notes="Rinde muy bien en CPU",
+    ),
     ModelSpec("mistral", "Mistral Nemo", 12.0, "general", n_layers=40, hidden=5120, notes="12B con contexto grande"),
-    ModelSpec("mistral", "Mixtral 8x7B (MoE)", 46.7, "general", n_layers=32, hidden=4096, notes="MoE: pesado en RAM; mejor GPU"),
+    ModelSpec(
+        "mistral", "Mixtral 8x7B (MoE)", 46.7, "general",
+        n_layers=32, hidden=4096, notes="MoE: pesado en RAM; mejor GPU",
+    ),
 
     # Gemma
     ModelSpec("google", "Gemma 2", 2.0, "general", n_layers=18, hidden=2048, notes="Pequeño y decente"),
@@ -120,7 +134,10 @@ MODEL_CATALOG: List[ModelSpec] = [
     ModelSpec("microsoft", "Phi-4", 14.0, "reasoning", n_layers=40, hidden=5120, notes="Mejor razonamiento; pesado"),
 
     # DeepSeek (razonamiento)
-    ModelSpec("deepseek", "DeepSeek R1 Distill", 1.5, "reasoning", n_layers=28, hidden=1536, notes="Razonamiento liviano"),
+    ModelSpec(
+        "deepseek", "DeepSeek R1 Distill", 1.5, "reasoning",
+        n_layers=28, hidden=1536, notes="Razonamiento liviano",
+    ),
     ModelSpec("deepseek", "DeepSeek R1", 7.0, "reasoning", n_layers=32, hidden=4096, notes="Razonamiento local"),
     ModelSpec("deepseek", "DeepSeek R1", 14.0, "reasoning", n_layers=40, hidden=5120, notes="Mejor, más RAM"),
 
@@ -144,15 +161,15 @@ class MachineInfo:
     cpu_model: str
     physical_cores: int
     logical_cores: int
-    cpu_mhz: Optional[float]
-    cpu_flags: List[str]
+    cpu_mhz: float | None
+    cpu_flags: list[str]
     ram_total_gb: float
     ram_available_gb: float
     swap_total_gb: float
     swap_free_gb: float
 
 
-def run_cmd(cmd: List[str]) -> str:
+def run_cmd(cmd: list[str]) -> str:
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
         return out.strip()
@@ -160,10 +177,10 @@ def run_cmd(cmd: List[str]) -> str:
         return ""
 
 
-def get_cpu_flags_linux() -> List[str]:
+def get_cpu_flags_linux() -> list[str]:
     flags = set()
     try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if line.lower().startswith("flags"):
                     _, v = line.split(":", 1)
@@ -177,7 +194,7 @@ def get_cpu_flags_linux() -> List[str]:
 
 def get_cpu_model_linux() -> str:
     try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if line.lower().startswith("model name"):
                     return line.split(":", 1)[1].strip()
@@ -186,10 +203,10 @@ def get_cpu_model_linux() -> str:
     return platform.processor() or "Unknown CPU"
 
 
-def get_cpu_mhz_linux() -> Optional[float]:
+def get_cpu_mhz_linux() -> float | None:
     # Best effort
     try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if line.lower().startswith("cpu mhz"):
                     return float(line.split(":", 1)[1].strip())
@@ -265,7 +282,7 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
-def estimate_weights_gb(params_b: float, quant: str) -> Tuple[float, float]:
+def estimate_weights_gb(params_b: float, quant: str) -> tuple[float, float]:
     bpw = BPW_MAP.get(quant.upper(), 4.65)  # default conservador
     params = params_b * 1e9
     bytes_weights = params * (bpw / 8.0)
@@ -304,7 +321,7 @@ def classify_fit(total_req: float, budget: float) -> str:
     return "MAL"
 
 
-def cpu_capability_hint(flags: List[str]) -> str:
+def cpu_capability_hint(flags: list[str]) -> str:
     f = set(flags)
     if "avx512f" in f:
         return "CPU: AVX-512 (muy bien)"
@@ -326,9 +343,7 @@ def score_result(r: FitResult, preference: str) -> float:
         if r.task == preference:
             pref_bonus -= 3.0
         # coding prefer: penaliza no-coding levemente
-        elif preference == "coding" and r.task != "coding":
-            pref_bonus += 2.0
-        elif preference == "reasoning" and r.task != "reasoning":
+        elif preference == "coding" and r.task != "coding" or preference == "reasoning" and r.task != "reasoning":
             pref_bonus += 2.0
 
     # objetivo: minimizar (mem + penalizaciones)
@@ -339,19 +354,21 @@ def build_recommendations(
     mi: MachineInfo,
     ctx: int,
     headroom: float,
-    quants: List[str],
+    quants: list[str],
     kv_dtype_bytes: int,
     kv_conservative_factor: float,
     preference: str,
     top_n: int,
-) -> Tuple[List[FitResult], Dict]:
+) -> tuple[list[FitResult], dict]:
     budget = max(0.0, mi.ram_total_gb * (1.0 - headroom))
 
-    results: List[FitResult] = []
+    results: list[FitResult] = []
     for spec in MODEL_CATALOG:
         for q in quants:
             w_gb, bpw = estimate_weights_gb(spec.params_b, q)
-            kv_gb = estimate_kv_cache_gb(spec, ctx=ctx, kv_dtype_bytes=kv_dtype_bytes, conservative_factor=kv_conservative_factor)
+            kv_gb = estimate_kv_cache_gb(
+                spec, ctx=ctx, kv_dtype_bytes=kv_dtype_bytes, conservative_factor=kv_conservative_factor
+            )
             ov_gb = estimate_overhead_gb(w_gb)
             total = w_gb + kv_gb + ov_gb
             fit = classify_fit(total, budget)
@@ -389,7 +406,7 @@ def build_recommendations(
     return top, summary
 
 
-def print_table(results: List[FitResult]) -> None:
+def print_table(results: list[FitResult]) -> None:
     rows = []
     for r in results:
         rows.append([
@@ -457,7 +474,10 @@ def main() -> None:
     print(f"SWAP    : {mi.swap_total_gb:.2f} GB total | {mi.swap_free_gb:.2f} GB free")
     print(f"HINT    : {summary['cpu_hint']}")
     print(f"BUDGET  : {summary['budget_gb']:.2f} GB (headroom={summary['headroom']:.2f})")
-    print(f"CTX     : {summary['ctx']} (KV bytes={summary['kv_dtype_bytes']}, KV factor={summary['kv_conservative_factor']})")
+    print(
+        f"CTX     : {summary['ctx']} (KV bytes={summary['kv_dtype_bytes']}, "
+        f"KV factor={summary['kv_conservative_factor']})"
+    )
     print("=" * 88)
     print()
 
